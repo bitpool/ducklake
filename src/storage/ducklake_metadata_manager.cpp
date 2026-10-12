@@ -4800,6 +4800,17 @@ string DuckLakeMetadataManager::WriteCompactions(const vector<DuckLakeCompactedF
 	}
 }
 
+//! Selects the files that the filter matches or whose range no remaining snapshot lies in
+static string UnusedFilesQuery(const string &file_table, const string &file_id_column, const string &filter) {
+	// only the first remaining snapshot at or after begin_snapshot matters
+	return StringUtil::Format(R"(
+SELECT f.%s, f.table_id, f.path, f.path_is_relative
+FROM {METADATA_CATALOG}.%s f
+ASOF LEFT JOIN {METADATA_CATALOG}.ducklake_snapshot s ON f.begin_snapshot <= s.snapshot_id
+WHERE %s(f.end_snapshot IS NOT NULL AND (s.snapshot_id IS NULL OR s.snapshot_id >= f.end_snapshot));)",
+	                          file_id_column, file_table, filter);
+}
+
 void DuckLakeMetadataManager::DeleteSnapshots(const vector<DuckLakeSnapshotInfo> &snapshots) {
 	unique_ptr<QueryResult> result;
 	// first delete the actual snapshots
@@ -4864,18 +4875,10 @@ AND NOT EXISTS (
 	// get a list of files that are no longer required after these deletions
 	string table_id_filter;
 	if (!deleted_table_ids.empty()) {
-		table_id_filter = StringUtil::Format("table_id IN (%s) OR", deleted_table_ids);
+		table_id_filter = StringUtil::Format("f.table_id IN (%s) OR ", deleted_table_ids);
 	}
 
-	result = transaction.Query(StringUtil::Format(R"(
-SELECT data_file_id, table_id, path, path_is_relative
-FROM {METADATA_CATALOG}.ducklake_data_file
-WHERE %s (end_snapshot IS NOT NULL AND NOT EXISTS(
-    SELECT snapshot_id
-    FROM {METADATA_CATALOG}.ducklake_snapshot
-    WHERE snapshot_id >= begin_snapshot AND snapshot_id < end_snapshot
-));)",
-	                                              table_id_filter));
+	result = transaction.Query(UnusedFilesQuery("ducklake_data_file", "data_file_id", table_id_filter));
 	vector<DuckLakeFileForCleanup> cleanup_files;
 	for (auto &row : *result) {
 		DuckLakeFileForCleanup info;
@@ -4932,18 +4935,11 @@ VALUES %s;
 	// get a list of delete files that are no longer required after these deletions
 	string file_id_filter;
 	if (!deleted_file_ids.empty()) {
-		file_id_filter = StringUtil::Format("data_file_id IN (%s) OR", deleted_file_ids);
+		file_id_filter = StringUtil::Format("f.data_file_id IN (%s) OR ", deleted_file_ids);
 	}
 
-	result = transaction.Query(StringUtil::Format(R"(
-SELECT delete_file_id, table_id, path, path_is_relative
-FROM {METADATA_CATALOG}.ducklake_delete_file
-WHERE %s %s (end_snapshot IS NOT NULL AND NOT EXISTS(
-    SELECT snapshot_id
-    FROM {METADATA_CATALOG}.ducklake_snapshot
-    WHERE snapshot_id >= begin_snapshot AND snapshot_id < end_snapshot
-));)",
-	                                              table_id_filter, file_id_filter));
+	result =
+	    transaction.Query(UnusedFilesQuery("ducklake_delete_file", "delete_file_id", table_id_filter + file_id_filter));
 	vector<DuckLakeFileForCleanup> cleanup_deletes;
 	for (auto &row : *result) {
 		DuckLakeFileForCleanup info;
