@@ -86,6 +86,7 @@ jobs:
           OPENSSL_DIR=/duckdb_build_dir/build/release/vcpkg_installed/$VCPKG_TARGET_TRIPLET
           OPENSSL_USE_STATIC_LIBS=true
           DUCKDB_PLATFORM=linux_amd64
+          DUCKDB_VERSION=$DUCKDB_VERSION
           DUCKDB_GIT_VERSION=$DUCKDB_VERSION
           ENABLE_EXTENSION_AUTOINSTALL=1
           ENABLE_EXTENSION_AUTOLOADING=1
@@ -106,9 +107,12 @@ jobs:
       - name: Test extension (inside Docker)
         run: docker run --env-file=docker_env.txt -v `pwd`:/duckdb_build_dir duckdb/linux_amd64 make test_release
 
+      # DuckDB 2.0 takes its version from DUCKDB_VERSION, not from git describe. Without it the build is a
+      # dev build, and the DuckDB v2.0.0 release refuses to load the extension.
       - name: Print the build identity
         run: |
           ./build/release/duckdb -c "SELECT version() AS duckdb, (SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'ducklake') AS ducklake"
+          test "$(./build/release/duckdb -noheader -list -c 'SELECT version()')" = "$DUCKDB_VERSION"
           sha256sum build/release/extension/ducklake/ducklake.duckdb_extension
 
       - uses: actions/upload-artifact@v4
