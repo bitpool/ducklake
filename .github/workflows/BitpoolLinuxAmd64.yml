@@ -1,0 +1,118 @@
+#
+# bitpool: build and test ducklake for DuckDB v2.0.0 on linux_amd64 only.
+#
+# The bitpool org allows only GitHub-owned actions, so this job runs the steps of the `linux`
+# job of duckdb/extension-ci-tools `_extension_distribution.yml@v2.0-cyanoptera` itself: the same
+# builder image, vcpkg commit, make targets and artifact path. The free-disk-space action
+# becomes a plain `rm`, and there is no ccache.
+#
+name: Bitpool linux_amd64 build
+on:
+  push:
+    branches: [bitpool/parallel-redate-v200]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux_amd64:
+    name: Build and test (linux_amd64, DuckDB v2.0.0)
+    runs-on: ubuntu-24.04
+    env:
+      DUCKDB_VERSION: v2.0.0
+      # v2.0-cyanoptera on 2026-10-22
+      CI_TOOLS_VERSION: b8d325c37e82160886579880707493bd358c0e62
+      VCPKG_URL: https://github.com/microsoft/vcpkg.git
+      VCPKG_COMMIT: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
+      VCPKG_BINARY_SOURCES: clear;http,https://vcpkg-cache.duckdb.org,read
+      VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+      VCPKG_TARGET_TRIPLET: x64-linux-release
+      VCPKG_HOST_TRIPLET: x64-linux-release
+      EXTENSION_NAME: ducklake
+      DUCKDB_PLATFORM: linux_amd64
+      GEN: ninja
+      BUILD_SHELL: 1
+
+    steps:
+      - name: Free disk space
+        continue-on-error: true
+        run: |
+          sudo rm -rf /usr/local/.ghcup /opt/hostedtoolcache /usr/local/share/powershell /usr/share/swift
+          docker images -a -q | xargs -r docker rmi
+
+      - name: Move Docker storage to /mnt
+        run: |
+          sudo systemctl stop docker
+          sudo mkdir -p /mnt/docker-data
+          echo '{ "data-root": "/mnt/docker-data" }' | sudo tee /etc/docker/daemon.json
+          sudo systemctl start docker
+          docker info | grep "Docker Root Dir"
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - uses: actions/checkout@v4
+        name: Checkout extension-ci-tools
+        with:
+          path: extension-ci-tools
+          ref: ${{ env.CI_TOOLS_VERSION }}
+          repository: duckdb/extension-ci-tools
+          fetch-depth: 0
+
+      - name: Checkout DuckDB to version
+        run: DUCKDB_GIT_VERSION=$DUCKDB_VERSION make set_duckdb_version
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --build-arg "vcpkg_url=$VCPKG_URL" \
+            --build-arg "vcpkg_commit=$VCPKG_COMMIT" \
+            --build-arg 'extra_toolchains=;;' \
+            -t duckdb/linux_amd64 \
+            ./extension-ci-tools/docker/linux_amd64
+
+      - name: Create env file for docker
+        run: |
+          cat <<-EOF > docker_env.txt
+          VCPKG_BINARY_SOURCES=$VCPKG_BINARY_SOURCES
+          VCPKG_TARGET_TRIPLET=$VCPKG_TARGET_TRIPLET
+          VCPKG_OVERLAY_TRIPLETS=/duckdb_build_dir/extension-ci-tools/toolchains
+          VCPKG_OVERLAY_PORTS=/duckdb_build_dir/extension-ci-tools/vcpkg_ports
+          BUILD_SHELL=1
+          OPENSSL_ROOT_DIR=/duckdb_build_dir/build/release/vcpkg_installed/$VCPKG_TARGET_TRIPLET
+          OPENSSL_DIR=/duckdb_build_dir/build/release/vcpkg_installed/$VCPKG_TARGET_TRIPLET
+          OPENSSL_USE_STATIC_LIBS=true
+          DUCKDB_PLATFORM=linux_amd64
+          DUCKDB_GIT_VERSION=$DUCKDB_VERSION
+          ENABLE_EXTENSION_AUTOINSTALL=1
+          ENABLE_EXTENSION_AUTOLOADING=1
+          EXTENSION_NAME=$EXTENSION_NAME
+          LINUX_CI_IN_DOCKER=1
+          SUBSET_EXTENSIONS_TESTS=regular
+          EOF
+
+      - name: Run configure (inside Docker)
+        run: docker run --env-file=docker_env.txt -v `pwd`:/duckdb_build_dir duckdb/linux_amd64 make configure_ci
+
+      - name: Build extension (inside Docker)
+        run: docker run --env-file=docker_env.txt -v `pwd`:/duckdb_build_dir duckdb/linux_amd64 make release
+
+      - name: Test the parallel re-date first (inside Docker)
+        run: docker run --env-file=docker_env.txt -v `pwd`:/duckdb_build_dir duckdb/linux_amd64 make test_release T=test/sql/delete/delete_commit_snapshot_many_files.test
+
+      - name: Test extension (inside Docker)
+        run: docker run --env-file=docker_env.txt -v `pwd`:/duckdb_build_dir duckdb/linux_amd64 make test_release
+
+      - name: Print the build identity
+        run: |
+          ./build/release/duckdb -c "SELECT version() AS duckdb, (SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'ducklake') AS ducklake"
+          sha256sum build/release/extension/ducklake/ducklake.duckdb_extension
+
+      - uses: actions/upload-artifact@v4
+        with:
+          if-no-files-found: error
+          name: ducklake-v2.0.0-extension-linux_amd64
+          path: build/release/extension/ducklake/ducklake.duckdb_extension
