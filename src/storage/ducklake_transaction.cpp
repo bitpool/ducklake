@@ -20,6 +20,7 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "duckdb/parallel/task_executor.hpp"
 #include "duckdb/planner/tableref/bound_at_clause.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_macro_entry.hpp"
@@ -732,16 +733,54 @@ bool LocalTableChanges::HasDatedNewDeletes() const {
 	return result;
 }
 
+//! Dates the new deletes of one delete file to the commit snapshot
+class SetDeleteCommitSnapshotTask : public BaseExecutorTask {
+public:
+	SetDeleteCommitSnapshotTask(TaskExecutor &executor, ClientContext &context, DuckLakeTransaction &transaction,
+	                            DuckLakeDeleteFile &file, idx_t commit_snapshot)
+	    : BaseExecutorTask(executor), context(context), transaction(transaction), file(file),
+	      commit_snapshot(commit_snapshot) {
+	}
+
+	void ExecuteTask() override {
+		DuckLakeDeleteFileWriter::SetCommitSnapshot(context, transaction, file, commit_snapshot);
+	}
+
+	string TaskType() const override {
+		return "SetDeleteCommitSnapshotTask";
+	}
+
+private:
+	ClientContext &context;
+	DuckLakeTransaction &transaction;
+	DuckLakeDeleteFile &file;
+	idx_t commit_snapshot;
+};
+
 void LocalTableChanges::SetDeleteCommitSnapshot(ClientContext &context, DuckLakeTransaction &transaction,
                                                 idx_t commit_snapshot) {
 	lock_guard<mutex> guard(lock);
+	vector<reference<DuckLakeDeleteFile>> files;
 	for (auto &entry : changes) {
 		ForEachDeleteFile(entry.second, [&](DuckLakeDeleteFile &file) {
-			if (file.DatesNewDeletes()) {
-				DuckLakeDeleteFileWriter::SetCommitSnapshot(context, transaction, file, commit_snapshot);
+			if (file.DatesNewDeletes() && file.max_snapshot.GetIndex() != commit_snapshot) {
+				files.push_back(file);
 			}
 		});
 	}
+	if (files.empty()) {
+		return;
+	}
+	// a retry rewrites these files between its conflict check and its snapshot insert, and a commit of another
+	// writer in that window makes it fail again - each rewrite waits on storage, so they run in parallel
+	TaskExecutor executor(context, TaskSchedulerType::ASYNC);
+	vector<unique_ptr<BaseExecutorTask>> tasks;
+	for (auto &file : files) {
+		tasks.push_back(
+		    make_uniq<SetDeleteCommitSnapshotTask>(executor, context, transaction, file.get(), commit_snapshot));
+	}
+	executor.ScheduleTasks(std::move(tasks));
+	executor.WorkOnTasks();
 }
 
 LocalTableChangeIterationHelper LocalTableChanges::Changes() const {

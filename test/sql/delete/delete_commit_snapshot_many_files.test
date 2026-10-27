@@ -1,0 +1,90 @@
+# name: test/sql/delete/delete_commit_snapshot_many_files.test
+# description: A retried commit dates the new deletes of every delete file it rewrites and removes the replaced files
+# group: [delete]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+test-env DATA_PATH {TEST_DIR}
+
+# the rewrites of one commit run as parallel tasks
+statement ok
+SET async_threads = 8
+
+statement ok
+SET ducklake_retry_wait_ms = 0
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{DATA_PATH}/delete_commit_snapshot_many_files', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE ducklake.t1 (id INTEGER)
+
+statement ok
+CREATE TABLE ducklake.t2 (id INTEGER)
+
+# snapshots 3 to 34 write 32 data files
+loop i 0 32
+
+statement ok
+INSERT INTO ducklake.t1 SELECT ${i} * 10 + range FROM range(10)
+
+endloop
+
+# snapshot 35 writes the first delete file of every data file
+statement ok
+DELETE FROM ducklake.t1 WHERE id % 10 = 0
+
+statement ok con1
+BEGIN
+
+# each data file gets a delete file that dates its new delete to snapshot 36
+statement ok con1
+DELETE FROM ducklake.t1 WHERE id % 10 = 1
+
+# snapshot 36 lands before con1 commits, so the commit retries and rewrites all 32 delete files
+statement ok con2
+INSERT INTO ducklake.t2 VALUES (42)
+
+statement ok con1
+COMMIT
+
+query II
+SELECT snapshot_id, changes FROM ducklake.snapshots() WHERE snapshot_id >= 35 ORDER BY ALL
+----
+35	{tables_deleted_from=[1]}
+36	{tables_inserted_into=[2]}
+37	{tables_deleted_from=[1]}
+
+query I
+SELECT count(*) FROM ducklake.t1 AT (VERSION => 36)
+----
+288
+
+query I
+SELECT count(*) FROM ducklake.t1
+----
+256
+
+query III
+SELECT snapshot_id, change_type, count(*) FROM ducklake_table_changes('ducklake', 'main', 't1', 35, 37)
+GROUP BY ALL ORDER BY ALL
+----
+35	delete	32
+37	delete	32
+
+# every delete file holds both deletes, and the new ones are dated to the commit snapshot
+query IIIIII
+SELECT count(*), sum(delete_count), min(begin_snapshot), max(begin_snapshot), min(partial_max), max(partial_max)
+FROM __ducklake_metadata_ducklake.ducklake_delete_file WHERE end_snapshot IS NULL
+----
+32	64	35	35	37	37
+
+# 32 delete files of snapshot 35 and 32 of the commit; the files written before the commit are removed
+query I
+SELECT count(*) FROM glob('{DATA_PATH}/delete_commit_snapshot_many_files/**/*-delete.*')
+----
+64
